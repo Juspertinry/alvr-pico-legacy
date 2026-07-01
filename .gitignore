@@ -1,0 +1,34 @@
+# --- Build output -----------------------------------------------------------
+build/
+app/build/
+.gradle/
+.cxx/
+app/.cxx/
+
+# Native object / cmake cache
+**/.cxx/
+
+# Packaged artifacts
+*.apk
+*.aab
+*.ap_
+
+# --- Machine-specific config (do NOT commit) --------------------------------
+local.properties
+
+# --- Signing secrets (NEVER commit) -----------------------------------------
+keystore.properties
+*.jks
+*.keystore
+
+# Backups of swapped prebuilt .so files (large, local-only)
+app/backups_jnilibs/
+
+# --- IDE --------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+# Normalize text line endings across platforms.
+* text=auto
+
+# The Gradle wrapper Unix script must stay LF or it breaks on Linux/macOS.
+gradlew text eol=lf
+
+# Windows-only scripts stay CRLF.
+gradlew.bat text eol=crlf
+*.ps1        text eol=crlf
+
+# Binary assets: never touch line endings.
+*.jar  binary
+*.so   binary
+*.png  binary
+*.apk  binary
+*.aab  binary

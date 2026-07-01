@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ALVR networking: control/stream sockets + mDNS server discovery -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- WifiLock(HIGH_PERF).acquire() requires WAKE_LOCK -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Mic-to-PC streaming. Dangerous permission: requested at runtime during
+         init via alvr_try_get_permission(RECORD_AUDIO), which surfaces the system
+         grant dialog through the activity. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Eye tracking (Neo 2 EYE); harmless on non-Eye units. Legacy Pico eye
+         tracking also needs the service enabled via the SDK before
+         Pvr_GetEyeTrackingData returns data. -->
+    <uses-permission android:name="com.picovr.permission.EYE_TRACKING" />
+
+    <application
+        android:label="ALVR"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+        android:allowBackup="false">
+
+        <!-- These metadata entries tell PUI to run the app in stereo VR mode. -->
+        <meta-data android:name="pvr.app.type" android:value="vr" />
+        <meta-data android:name="pvr.display.orientation" android:value="180" />
+        <meta-data android:name="com.pvr.hmd.trackingmode" android:value="6dof" />
+        <meta-data android:name="com.pvr.instructionset" android:value="32" />
+        <meta-data android:name="platform_logo" android:value="0" />
+        <meta-data android:name="isPUI" android:value="0" />
+        <meta-data android:name="enable_entitlementcheck" android:value="0" />
+
+        <activity
+            android:name=".MainActivity"
+            android:label="ALVR"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask"
+            android:configChanges="screenSize|orientation|keyboardHidden|keyboard"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
