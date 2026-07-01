@@ -1112,7 +1112,14 @@ static void *trackingThread(void *) {
                 }
             }
             prevQ = curQ; prevP[0]=px; prevP[1]=py; prevP[2]=pz; prevTs = ts; havePrev = true;
-            hmd.linear_velocity[0]  = fLin[0]; hmd.linear_velocity[1]  = fLin[1]; hmd.linear_velocity[2]  = fLin[2];
+            // Position: scale the reported linear velocity by the same predict factor
+            // the controllers use (kBasePredict), so the head's positional extrapolation
+            // reach matches the hands' instead of running at full 1.0. Rotation is left
+            // unscaled -- the DIATW warp already reprojects orientation to the live pose
+            // every vsync locally, so the server-side angular reach isn't the lever here.
+            float hp = kBasePredict;
+            if (hp < 0.0f) hp = 0.0f; else if (hp > 1.0f) hp = 1.0f;
+            hmd.linear_velocity[0]  = fLin[0] * hp; hmd.linear_velocity[1]  = fLin[1] * hp; hmd.linear_velocity[2]  = fLin[2] * hp;
             hmd.angular_velocity[0] = fAng[0]; hmd.angular_velocity[1] = fAng[1]; hmd.angular_velocity[2] = fAng[2];
         }
 
@@ -2327,6 +2334,73 @@ void *renderThread(void *) {
             // after the gate in its vcount is overwritten before submit (72 arrive but
             // only ~60 shown) for no benefit now the per-eye texture race is fixed.
             bool doSubmit = (drained > 0);
+
+            // ADAPTIVE FRAME PACING (anti-judder). Submitting every decoded frame is
+            // fine while we hold 72, but once the device can't keep up it presents at
+            // an irregular 55-67 fps that beats the 72Hz scanout: each warp-pose update
+            // then lands a different number of vsyncs apart and snaps the view by a
+            // different amount, which reads as violent shake. Dropping CLEANLY to an
+            // evenly-spaced lower rate (every 2nd/3rd vsync) is lower fps but smooth,
+            // because every present is held the same span. Opening a HUD only ever
+            // "fixed" this by loading the GPU enough to force a steady 36Hz by accident.
+            //
+            // ZERO COST WHILE WE KEEP UP: at sPaceDiv==1 this ONLY observes cadence to
+            // decide when to back off -- it never sleeps and never re-drains, so a
+            // healthy 72Hz stream submits exactly as before with no added latency. The
+            // phase-lock sleep engages only after we've already dropped to 36/24Hz,
+            // where holding an even beat is worth a little queueing. sPaceDiv moves with
+            // asymmetric hysteresis (back off fast on missed deadlines, speed up only
+            // after a long clean spell) so it settles instead of oscillating.
+            static int      sPaceDiv = 1;          // 1=72Hz, 2=36Hz, 3=24Hz
+            static int64_t  sLastSubmitVs = 0;
+            static int      sWinMiss = 0;
+            static uint64_t sWinT0 = 0, sLastMissNs = 0;
+            if (doSubmit) {
+                const double interval = 1e9 / 72.0;         // panel vsync period (ns)
+                int64_t cur = (int64_t) floor(PVR::GetFractionalVsync());
+                if (sPaceDiv > 1) {
+                    // Reduced rate: phase-lock the present to an even sPaceDiv-vsync beat.
+                    int64_t target = sLastSubmitVs + sPaceDiv;
+                    if (cur < target) {
+                        double waitVs = (double) target - PVR::GetFractionalVsync();
+                        if (waitVs > 0.0 && waitVs < 4.0)   // guard a bogus oracle read
+                            usleep((useconds_t)(waitVs * interval / 1000.0));
+                        cur = (int64_t) floor(PVR::GetFractionalVsync());
+                    }
+                    // Grab any fresher frame that arrived during the wait, so pacing only
+                    // regularises WHEN we present -- no extra latency on the frame shown.
+                    while (alvr_get_frame(&fts, &fbuf)) { ts = fts; hwbuf = fbuf; drained++; }
+                }
+                // A miss = this submit ran past the current rate's vsync budget AND the
+                // decoder had a backlog (drained>1 => our fault, not a slow/bursty source:
+                // a late submit with one frame in hand is sub-72 server fps / a network
+                // gap / a reconnect transient, which must not drop the rate).
+                int64_t spacing = (sLastSubmitVs != 0) ? (cur - sLastSubmitVs) : sPaceDiv;
+                sLastSubmitVs = cur;
+                bool ourMiss = (spacing - sPaceDiv > 0 && drained > 1);
+
+                // Act on the FREQUENCY of misses, never on a single one. A lone stall --
+                // a periodic keyframe-decode or GC spike, seen as one frame overrunning
+                // 10+ vsyncs -- must NOT step the rate down: the frame already hitched, so
+                // dropping the rate can't un-hitch it and only pumps 72<->24, which looks
+                // worse than the isolated jerk. Only a SUSTAINED beat of misses in a short
+                // window -- where an even lower rate is genuinely smoother -- backs off.
+                uint64_t pnow = nowNs();
+                if (ourMiss) { sWinMiss++; sLastMissNs = pnow; }
+                if (sWinT0 == 0) sWinT0 = pnow;
+                if (pnow - sWinT0 >= 250000000ULL) {        // short window -> quick onset
+                    if (sWinMiss >= 2 && sPaceDiv < 3) {
+                        sPaceDiv++;
+                        LOGI("pace: shake guard -> %dHz (%d misses/0.25s)", 72 / sPaceDiv, sWinMiss);
+                    } else if (sPaceDiv > 1 && pnow - sLastMissNs >= 3000000000ULL) {
+                        // Step back up only after a sustained clean spell (no miss for ~3s),
+                        // one level at a time, so it settles instead of oscillating.
+                        sPaceDiv--;
+                        LOGI("pace: recovered -> %dHz", 72 / sPaceDiv);
+                    }
+                    sWinMiss = 0; sWinT0 = pnow;
+                }
+            }
             // STUTTER DIAGNOSTIC: per-stage timing, per-second max (ms). gap =
             // submit-to-submit period (captures EVERYTHING between presents incl. the
             // top-of-loop tracking + sleep + drain); render/enc = our GPU-issue cost.
