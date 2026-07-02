@@ -6,7 +6,7 @@ Works with [ALVR server 20.14.1](https://github.com/alvr-org/ALVR/releases/tag/v
 
 ## Features
 
-- Lobby accessible from anywhere with a double-press of the right app button
+- Lobby accessible anywhere with menu double-press
 - In-app 16-band audio equalizer
 - Software IPD adjustment
 - Eye tracking (Neo 2 Eye)
