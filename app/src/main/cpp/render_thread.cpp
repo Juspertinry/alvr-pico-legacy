@@ -43,6 +43,17 @@
 #include "foveation.h"   // readFoveationParams() from the settings JSON
 #include "render_thread.h"// shared render-thread lifetime/window/sleep state
 
+// Sleep until an ABSOLUTE CLOCK_MONOTONIC deadline (nanoseconds, same base as
+// nowNs). clock_nanosleep(TIMER_ABSTIME) doesn't accumulate the oversleep a
+// relative usleep does under scheduler load (1-4ms), so submit cadence stays tight.
+// A deadline already in the past returns immediately.
+static inline void sleepUntilMonoNs(uint64_t deadlineNs) {
+    struct timespec t;
+    t.tv_sec  = (time_t)(deadlineNs / 1000000000ULL);
+    t.tv_nsec = (long)(deadlineNs % 1000000000ULL);
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, nullptr);
+}
+
 static const char *alvrEventName(AlvrEvent_Tag t) {
     switch (t) {
         case ALVR_EVENT_HUD_MESSAGE_UPDATED: return "HUD_MESSAGE_UPDATED";
@@ -204,6 +215,12 @@ static float gRefreshHint = 72.0f;
 static bool   gStreaming = false;
 static bool   gDecoderReady = false;
 static bool   gAlvrGlReady = false;
+// Set by STREAMING_STARTED, consumed by the video submit path: reset the frame
+// pacer + per-second video counters at the start of each stream. Their statics
+// otherwise carry across streams, so a session that ended throttled (sPaceDiv=3)
+// would start the next one capped at 24Hz, and the first submit would compute a
+// bogus vsync spacing from the old stream's sLastSubmitVs.
+static bool   gResetPacer = false;
 
 
 // HW-compositor lobby: a per-eye ring of textures we render the lobby into and
@@ -487,6 +504,10 @@ static bool     gHaveDecCfg = false;
 // clears these; the render loop retries the /proc scan until it lands or gives up.
 static bool     gDecoderPinned = false;
 static int      gDecoderPinTries = 0;
+// Same deal for the fork's video RECEIVE thread ("AlvrVideoRecv"), created per
+// connection. Re-armed on each STREAMING_STARTED; the loop retries the /proc scan.
+static bool     gVideoRecvPinned = false;
+static int      gVideoRecvPinTries = 0;
 
 // Push the current Software IPD (as per-eye optical-centre offset) + our FOV to
 // the server. Called at STREAMING_STARTED and again whenever the IPD changes mid
@@ -548,7 +569,10 @@ static void createVideoDecoder() {
     dc.max_buffering_frames     = 1.5f;
     dc.buffering_history_weight = 0.90f;
     int fps = (int)(gRefreshHint > 1.0f ? gRefreshHint + 0.5f : 72.0f);
-    static AlvrMediacodecOption decOpts[5] = {};
+    // Local (not static): alvr_create_decoder copies the options into an owned Vec
+    // during the call, so the array only needs to live until then. A static would be
+    // a trap if this function were ever called off the single render thread.
+    AlvrMediacodecOption decOpts[5] = {};
     decOpts[0].key = "vendor.qti-ext-dec-low-latency.enable";
     decOpts[0].ty = ALVR_MEDIACODEC_PROP_TYPE_INT32; decOpts[0].value.int32 = 1;
     decOpts[1].key = "low-latency";
@@ -861,6 +885,33 @@ static bool pinDecoderThreadForLowLatency(int reservedCpu) {
     return true;
 }
 
+// Pin the fork's video RECEIVE thread ("AlvrVideoRecv" in connection.rs) to the big
+// cores minus the warp's core, mirroring the decoder pump. It's the first hop of
+// every frame (socket recv + NAL reassembly + the MediaCodec input-buffer copy), so
+// keeping it off busy little cores where background tasks land cuts frame-arrival
+// jitter upstream of the whole decode path. Light thread, so priority is left below
+// the pump/submit (nice fallback only) -- affinity is the win here, not priority.
+// Best-effort. Returns true once found + pinned so the caller stops scanning.
+static bool pinVideoRecvThreadForLowLatency(int reservedCpu) {
+    pid_t recvTid = findTidByComm("AlvrVideoRecv");
+    if (!recvTid) return false;   // recv thread not up / not named yet -> caller retries
+
+    long lo = 0, hi = 0;
+    cpu_set_t set = bigCoreSetExcept(reservedCpu, lo, hi);   // big half minus the warp's core
+    if (sched_setaffinity(recvTid, sizeof(set), &set) == 0)
+        LOGI("video recv tid=%d pinned to big cores [%ld..%ld] minus warp core %d",
+             (int)recvTid, lo, hi, reservedCpu);
+    else
+        LOGI("video recv affinity failed (errno=%d)", errno);
+    // Elevated nice so a background task can't preempt the frame's first hop, but
+    // below the pump/submit RT band (it blocks on the socket most of the time).
+    if (setpriority(PRIO_PROCESS, recvTid, -6) == 0)
+        LOGI("video recv nice=-6");
+    else
+        LOGI("video recv prio elevation denied (errno=%d)", errno);
+    return true;
+}
+
 // MAX PERFORMANCE: pin the SoC CPU/GPU perf level via the Pico/QVR perf service --
 // the same clock-floor knob the VR-home Power Profile drives. Always on, so we don't
 // depend on the headset's Power Profile for a stable floor during streaming (a
@@ -923,17 +974,17 @@ static float gpuZoneTempC() {
     return best < 0 ? -1.0f : (float)best / 1000.0f;
 }
 
-// THERMAL-ADAPTIVE perf level. We normally hard-pin CPU/GPU to kPerfLevelMax (removes
+// THERMAL-ADAPTIVE perf level. We normally hard-pin CPU/GPU to kPerfLevelPin (removes
 // the governor's ramp-up latency when cool -- tighter frame timing). But on this
 // thermally limited SD845, sustained heavy worlds drive the GPU into the high 80s/90s
 // where the governor HARD-clamps the clock anyway.
-// Holding the request at MAX through that does nothing but add self-heat. So when the
-// GPU crosses kHotC we drop the requested floor ONE notch (max-1); we restore to max
-// once it falls back below kCoolC. The wide hysteresis band (kCoolC..kHotC) plus the
-// ~1Hz sample cadence prevents level flapping. Backing off the REQUEST proactively
+// Holding the request there through that does nothing but add self-heat. So when the
+// GPU crosses kHotC we drop the requested floor ONE notch (pin-1); we restore to the
+// pin once it falls back below kCoolC. The wide hysteresis band (kCoolC..kHotC) plus
+// the ~1Hz sample cadence prevents level flapping. Backing off the REQUEST proactively
 // eases the SoC before the governor's harder clamp -> smoother throttle, not a cliff.
 static const float kHotC  = 88.0f;   // step down above this GPU temp
-static const float kCoolC = 82.0f;   // restore to max below this (hysteresis)
+static const float kCoolC = 82.0f;   // restore to the pin below this (hysteresis)
 static int desiredPerfLevel() {
     static bool   sBackedOff = false;
     static uint64_t sLastSample = 0;
@@ -944,30 +995,25 @@ static int desiredPerfLevel() {
         if (t > 0.0f) {
             if (!sBackedOff && t >= kHotC) {
                 sBackedOff = true;
-                LOGI("perf: GPU %.1fC >= %.1fC -- backing off perf floor to max-1 (thermal)", t, kHotC);
+                LOGI("perf: GPU %.1fC >= %.1fC -- backing off perf floor to pin-1 (thermal)", t, kHotC);
             } else if (sBackedOff && t <= kCoolC) {
                 sBackedOff = false;
-                LOGI("perf: GPU %.1fC <= %.1fC -- restoring max perf floor", t, kCoolC);
+                LOGI("perf: GPU %.1fC <= %.1fC -- restoring pinned perf floor", t, kCoolC);
             }
         }
     }
     return sBackedOff ? (kPerfLevelPin - 1) : kPerfLevelPin;
 }
 
-// Optional GPU-only sub-cap below the CPU level. Currently DISABLED (== kPerfLevelMax)
-// because CPU+GPU already pin to kPerfLevelPin (4) uniformly. Kept as a lever in case
-// we later want the GPU a notch below the CPU.
-static const int kGpuLevelCap = kPerfLevelMax;
-
-// Apply a perf level (>=0 pins CPU to it + GPU to min(it,kGpuLevelCap); -1 releases
-// to the captured baseline). Returns true once the perf service accepted it;
-// SetCpuLevel returns -1 until the QVR service client is bound, so the caller retries.
+// Apply a perf level (>=0 pins CPU+GPU to it; -1 releases to the captured
+// baseline). Returns true once the perf service accepted it; SetCpuLevel returns
+// -1 until the QVR service client is bound, so the caller retries.
 static bool applyPerfLevels(int level) {
     capturePerfBaseline();
     bool on = (level >= 0);
     if (level > kPerfLevelMax) level = kPerfLevelMax;     // defensive clamp to valid range
     int wantCpu = on ? level : gPerfBaseCpu;
-    int wantGpu = on ? (level < kGpuLevelCap ? level : kGpuLevelCap) : gPerfBaseGpu;
+    int wantGpu = on ? level : gPerfBaseGpu;
     int rc = SetCpuLevel(wantCpu, on);   // 2nd arg = sustained/static floor while pinned
     int rg = SetGpuLevel(wantGpu, on);
     if (rc < 0 || rg < 0) {              // perf service client not bound yet -> retry
@@ -1932,20 +1978,27 @@ void *renderThread(void *) {
                 gDecoderPinned = true;
         }
 
+        // Same for the video receive thread (exists once connected, before the decoder
+        // even). Re-armed on STREAMING_STARTED; scanned on the same throttled cadence.
+        if (gStreaming && !gVideoRecvPinned && (frame % 8) == 0) {
+            if (pinVideoRecvThreadForLowLatency(reservedCpu) || ++gVideoRecvPinTries > 25)
+                gVideoRecvPinned = true;
+        }
+
         // ---- Head pose read-back (produced by the tracking thread) -----------
         // Tracking + the ALVR uplink now live on trackingThread (fixed ~300Hz).
         // The render thread only needs the latest head pose for the lobby head
         // transform + heartbeat log, so it reads the pose the tracking thread
         // publishes into gHeadData rather than calling the SDK a second time.
-        float qx=0,qy=0,qz=0,qw=1, px=0,py=0,pz=0, vfov=90;
+        float qx=0,qy=0,qz=0,qw=1, px=0,py=0,pz=0;
         {
             std::lock_guard<std::mutex> lk(gHeadMutex);
             qx=gHeadData[0]; qy=gHeadData[1]; qz=gHeadData[2]; qw=gHeadData[3];
             px=gHeadData[4]; py=gHeadData[5]; pz=gHeadData[6];
         }
         if ((frame % 120) == 0)
-            LOGI("frame %d q=(%.3f,%.3f,%.3f,%.3f) p=(%.3f,%.3f,%.3f) fov=%.1f vr=%d surf=%d",
-                 frame, qx,qy,qz,qw, px,py,pz, vfov, vrStarted, (sfc != EGL_NO_SURFACE));
+            LOGI("frame %d q=(%.3f,%.3f,%.3f,%.3f) p=(%.3f,%.3f,%.3f) vr=%d surf=%d",
+                 frame, qx,qy,qz,qw, px,py,pz, vrStarted, (sfc != EGL_NO_SURFACE));
 
         const uint64_t ts = nowNs();
 
@@ -2040,6 +2093,8 @@ void *renderThread(void *) {
                     sendViewParams();
                     gSwapIdx = 0;
                     gStreaming = true;
+                    gResetPacer = true;          // fresh stream -> reset pacer + video counters
+                    gVideoRecvPinned = false; gVideoRecvPinTries = 0;   // re-arm recv-thread pin for the new connection
                     gManualLobby.store(false);   // start in the stream, not the manual lobby
                     // Announce a CUSTOM interaction profile per hand: the exact source
                     // button set we actually drive. The server's automatic binder maps
@@ -2179,30 +2234,18 @@ void *renderThread(void *) {
         // gated on (frame % 8), so worst-case wake latency stays well under a second.
         if (sfc == EGL_NO_SURFACE) { frame++; usleep(50000); continue; }
 
-        // Enter VR a few frames after we first have a surface.
-        //
-        // NB(pico): this gates the Java startVRModel() entry point, which is a
-        // DIFFERENT, cruder way to bring up the SDK compositor than the path we
-        // actually use. startVRModel() spins up DIATW and lets it grab the panel
-        // WITHOUT our shared-context handoff -- so it either blacks the screen
-        // ("No valid Eye Buffers") or steals our window surface (eglSwapBuffers ->
-        // EGL_BAD_SURFACE -> surf=0 forever). The HW compositor we DO use is
-        // started up in the surface handler above via EV_InitRenderThread with a
-        // shared warp context + the eye textures fed to it; that path does not go
-        // through startVRModel. So leave this Java call gated off in both modes
-        // (PICO_USE_SDK_COMPOSITOR is off): HW mode already has its warp, and
-        // self-present owns the window itself. Tracking is service-based either way.
+        // Remove the platform logo a few frames after we first have a surface.
+        // NB(pico): we deliberately do NOT call the Java startVRModel() entry point
+        // here -- that's a cruder way to bring up the SDK compositor which lets
+        // DIATW grab the panel WITHOUT our shared-context handoff (black screen or
+        // stolen window surface). Our compositor is started in the surface handler
+        // above via EV_InitRenderThread with a shared warp context.
         // Use >= (not ==) so the one-shot logo removal still fires if framesWithSurface
         // ever skips the exact value 3 (e.g. a reset to a higher count, or surface
         // churn). The !vrStarted guard makes it fire exactly once.
         if (!vrStarted && framesWithSurface >= 3) {
             callVrStatic(env, "removePlatformLogo");
-#ifdef PICO_USE_SDK_COMPOSITOR
-            callVrStatic(env, "startVRModel");
-            LOGI("VR mode started (SDK compositor)");
-#else
-            LOGI("VR mode: self-present (SDK compositor disabled)");
-#endif
+            LOGI("VR mode: warp compositor active (startVRModel not used)");
             vrStarted = true;
         }
 
@@ -2251,29 +2294,32 @@ void *renderThread(void *) {
             menuPrev = menuNow;
         }
 
-        // ---- Manual-lobby: KEEP the video decoder ALIVE (no teardown) --------
-        // Do NOT destroy the decoder on lobby entry to save power: the fork leaks an
-        // ImageReader on every decoder teardown ("FIXME: Leaking Imagereader!"), so
-        // rapid lobby<->stream toggling wedges the Venus decoder/surface until a device
-        // reboot (every decoded frame then fails with sf error -38 -> "too many decoder
-        // errors" -> restart connection, forever). Instead the decoder stays alive
-        // across the toggle and is kept DRAINED below so it doesn't saturate while we
-        // aren't presenting its frames. Trade-off: the SoC keeps decoding video we don't
-        // show in the lobby (more power), but the connection stays rock-solid. Audio is
-        // on its own path, untouched.
+        // ---- Manual-lobby: PAUSE the decoder (no teardown) -------------------
+        // The decoder object stays alive across a lobby toggle (avoids the destroy/
+        // create hitch and the ImageReader churn), but on entry we PAUSE it: the core
+        // then discards incoming NALs before MediaCodec, so the HW Venus decoder goes
+        // idle -- the real power/thermal win while lingering in the menu. On exit we
+        // unpause, which requests a fresh IDR so playback resumes from a clean
+        // keyframe. Trade-off: the server keeps encoding+sending video we don't decode
+        // (network + PC-side cost), but the client-side decode -- the SoC's thermal
+        // lever -- stops. Audio is on its own path, untouched.
         {
             static bool sManualPrev = false;
             bool ml = gManualLobby.load();
-            if (ml && !sManualPrev) LOGI("manual lobby: decoder kept alive + drained");
-            else if (!ml && sManualPrev) LOGI("manual lobby exit: resuming presentation");
+            if (ml && !sManualPrev) {
+                if (gStreaming && gDecoderReady) alvr_set_decoder_paused(true);
+                LOGI("manual lobby: decoder paused (NALs discarded, Venus idle)");
+            } else if (!ml && sManualPrev) {
+                if (gStreaming && gDecoderReady) alvr_set_decoder_paused(false);   // requests fresh IDR
+                LOGI("manual lobby exit: decoder resumed (IDR requested)");
+            }
             sManualPrev = ml;
         }
 
-        // While in the manual lobby the present block below is short-circuited, so
-        // nothing consumes the decoder's output. Keep it DRAINED here: alvr_get_frame
-        // pop_front()s (and thus releases) the previous image and hands the next, so
-        // discarding everything available keeps the bounded ImageReader cycling and
-        // the decoder from saturating. Cheap no-op when no frame is ready.
+        // Drain any frames still queued at the instant we paused (a few may already
+        // be in the ImageReader). Once paused the decoder produces no new frames, so
+        // this is a cheap no-op after the first lobby frame. alvr_get_frame pop_front()s
+        // (and thus releases) the previous image, keeping the bounded ImageReader clear.
         if (gStreaming && gDecoderReady && gManualLobby.load()) {
             uint64_t dts = 0; void *dbuf = nullptr;
             while (alvr_get_frame(&dts, &dbuf)) { /* discard: not presenting in lobby */ }
@@ -2315,11 +2361,12 @@ void *renderThread(void *) {
             // BLOCK on the decoder for the first frame instead of busy-polling.
             // The fork's alvr_get_frame_timeout sleeps until the ImageReader pushes a
             // freshly decoded frame (or the cap elapses), so this loop wakes ~once per
-            // arrived frame (~72-120Hz) instead of spinning. Cap = 2 frame
+            // arrived frame (~72-120Hz) instead of spinning. Cap = 1.5 frame
             // intervals: under healthy streaming a frame always lands within 1, so we
             // wake on the frame; the cap only bounds how often top-of-loop housekeeping
-            // (surface/proximity/manual-lobby) runs when the stream stalls. Once the
-            // first frame is in hand, drain the rest non-blocking to coalesce to newest.
+            // (surface/proximity/manual-lobby) runs when the stream stalls -- 1.5 keeps
+            // that snappy during a stall while still comfortably clearing one interval.
+            // Once the first frame is in hand, drain the rest non-blocking to coalesce.
             //
             // BUFFER RELEASE (verified against the client_core fork, video_decoder/
             // android.rs dequeue_frame): coalescing here does NOT leak or starve the
@@ -2335,7 +2382,15 @@ void *renderThread(void *) {
             // dequeue_frame samples its buffering EMA every call, so a coalesced burst
             // samples it 2-3x/iteration -- but that biases the average DOWN, the safe
             // keep-more-buffer direction, so it's left as-is rather than forked.)
-            uint64_t blockNs = (uint64_t)(2e9f / (gRefreshHint > 1.0f ? gRefreshHint : 72.0f));
+            uint64_t blockNs = (uint64_t)(1.5e9f / (gRefreshHint > 1.0f ? gRefreshHint : 72.0f));
+            // ORDERING ASSUMPTION (B3): each alvr_get_frame here releases the PREVIOUS
+            // call's image back to the decoder immediately, but the GPU read of that
+            // image (alvr_render_stream_opengl last iteration) is only fenced, not
+            // waited. This is safe ONLY because the Venus decoder takes >= one frame to
+            // recycle+refill a released buffer -- longer than our render takes to drain
+            // its GPU work -- so the buffer is never overwritten mid-read. If this drain
+            // is ever reworked to hold multiple images or the render routinely overruns
+            // a frame (watch gFenceTimeouts), add an explicit fence wait before release.
             if (alvr_get_frame_timeout(&fts, &fbuf, blockNs)) {
                 ts = fts; hwbuf = fbuf; drained++;
                 while (alvr_get_frame(&fts, &fbuf)) { ts = fts; hwbuf = fbuf; drained++; }
@@ -2369,6 +2424,13 @@ void *renderThread(void *) {
             static int64_t  sLastSubmitVs = 0;
             static int      sWinMiss = 0;
             static uint64_t sWinT0 = 0, sLastMissNs = 0;
+            // Fresh stream: clear stale pacer state (don't clear gResetPacer yet -- the
+            // counters block below consumes it). Otherwise a stream that ended at 24Hz
+            // starts the next one throttled, and sLastSubmitVs from the old stream
+            // yields a bogus first spacing.
+            if (gResetPacer) {
+                sPaceDiv = 1; sLastSubmitVs = 0; sWinMiss = 0; sWinT0 = 0; sLastMissNs = 0;
+            }
             if (doSubmit) {
                 const double interval = 1e9 / 72.0;         // panel vsync period (ns)
                 int64_t cur = (int64_t) floor(PVR::GetFractionalVsync());
@@ -2378,7 +2440,9 @@ void *renderThread(void *) {
                     if (cur < target) {
                         double waitVs = (double) target - PVR::GetFractionalVsync();
                         if (waitVs > 0.0 && waitVs < 4.0)   // guard a bogus oracle read
-                            usleep((useconds_t)(waitVs * interval / 1000.0));
+                            // Absolute-deadline sleep (no usleep oversleep drift): the
+                            // wait duration in ns from now to the target vsync beat.
+                            sleepUntilMonoNs(nowNs() + (uint64_t)(waitVs * interval));
                         cur = (int64_t) floor(PVR::GetFractionalVsync());
                     }
                     // Grab any fresher frame that arrived during the wait, so pacing only
@@ -2693,6 +2757,13 @@ void *renderThread(void *) {
                 // (newest kept). decoded is the real decoder FPS; if decoded~72 but
                 // submits<72 we're coalescing, not starving.
                 static int sSubmits = 0, sDecoded = 0, sDropped = 0; static uint64_t vT0 = 0;
+                // Fresh stream: clear stale per-second counters + the diag gap anchor,
+                // then consume the reset flag (last user of it this iteration).
+                if (gResetPacer) {
+                    sSubmits = 0; sDecoded = 0; sDropped = 0; vT0 = 0;
+                    _lastStart = 0;
+                    gResetPacer = false;
+                }
                 sSubmits++;
                 sDecoded += drained;
                 if (drained > 1) sDropped += (drained - 1);
@@ -2752,8 +2823,10 @@ void *renderThread(void *) {
             // per-eye submit desync.
             {
                 const uint64_t kVsyncNs = (uint64_t)(1e9 / 72.0);   // 72Hz panel (do NOT exceed)
-                uint64_t work = nowNs() - tLoopStart;
-                if (work < kVsyncNs) usleep((useconds_t)((kVsyncNs - work) / 1000));
+                // Absolute deadline from the iteration start (clock_nanosleep TIMER_ABSTIME)
+                // rather than a relative usleep of the remainder: the relative form
+                // oversleeps under load and drifts the cadence. No-op if already past.
+                sleepUntilMonoNs(tLoopStart + kVsyncNs);
             }
             frame++; framesWithSurface++;
             continue;
@@ -2881,7 +2954,7 @@ void *renderThread(void *) {
         // single "click" = trigger press-edge (controller) or OK click (gaze).
         float ptrOx=px, ptrOy=py, ptrOz=pz;
         float ptrDx=-headRot.m[8], ptrDy=-headRot.m[9], ptrDz=-headRot.m[10];
-        bool  eqUsingController = false;   // (name kept for the laser draw below)
+        bool  ptrFromController = false;   // pointer is a controller laser (vs head gaze)
         bool  ptrGrab = gOkHeld.load();
         float ptrStickY = 0.0f;            // dominant-hand thumbstick Y (-1..1, up = +)
         bool  recenterDown = false;        // app/menu button (either hand) -> re-anchor panels
@@ -2946,7 +3019,7 @@ void *renderThread(void *) {
                 ptrOy = cc[h].pos[1]*0.001f + fwd0y*kFrontOff + uy*kUpOff;
                 ptrOz = cc[h].pos[2]*0.001f + fwd0z*kFrontOff + uz*kUpOff;
                 ptrGrab = trig(cc[h]);
-                eqUsingController = true;
+                ptrFromController = true;
                 // thumbstick Y for menu page-scrolling (keys[1]: center 128, 0..255)
                 if (cc[h].keyCount > 1) ptrStickY = (cc[h].keys[1] - 128) / 127.0f;
             }
@@ -2963,10 +3036,10 @@ void *renderThread(void *) {
         bool okClicked = gOkClick.exchange(false);
         static bool sPtrGrabPrev = false;
         bool grabEdge = ptrGrab && !sPtrGrabPrev;
-        bool clickEdge = eqUsingController ? grabEdge : okClicked;   // unified single-click
-        float eqLaserOx=ptrOx, eqLaserOy=ptrOy, eqLaserOz=ptrOz;     // laser draw inputs
-        float eqLaserDx=ptrDx, eqLaserDy=ptrDy, eqLaserDz=ptrDz;
-        float eqLaserLen = 100.0f;   // 100 m; clipped to a panel hit (below)
+        bool clickEdge = ptrFromController ? grabEdge : okClicked;   // unified single-click
+        float laserOx=ptrOx, laserOy=ptrOy, laserOz=ptrOz;     // laser draw inputs
+        float laserDx=ptrDx, laserDy=ptrDy, laserDz=ptrDz;
+        float laserLen = 100.0f;   // 100 m; clipped to a panel hit (below)
 
         // Ray vs a panel plane (column-major model matrix W). Returns hit + local x/y
         // (panel metres) + distance t. Also clips the laser length to the hit.
@@ -2983,7 +3056,7 @@ void *renderThread(void *) {
             float rx=hx-Qx, ry=hy-Qy, rz=hz-Qz;
             lx = rx*Rx + ry*Ry + rz*Rz;
             ly = rx*Ux + ry*Uy + rz*Uz;
-            if (eqUsingController && t < eqLaserLen) eqLaserLen = t - 0.01f;
+            if (ptrFromController && t < laserLen) laserLen = t - 0.01f;
             return true;
         };
 
@@ -3116,7 +3189,7 @@ void *renderThread(void *) {
         }
 
         sPtrGrabPrev = ptrGrab;
-        bool eqShowReticle = (!eqUsingController && lobbyHover);
+        bool showReticle = (!ptrFromController && lobbyHover);
 
         // ---- apply menu-requested side effects ----
         // The data-driven menu has no GL context / JNIEnv / locomotion access, so its
@@ -3159,11 +3232,11 @@ void *renderThread(void *) {
                 glBindVertexArray(0);
             }
             // Controller laser beam (world-space) when a controller drives the pointer.
-            if (eqUsingController) {
-                const float L = eqLaserLen;
-                float exr = eqLaserOx + eqLaserDx*L, eyr = eqLaserOy + eqLaserDy*L, ezr = eqLaserOz + eqLaserDz*L;
+            if (ptrFromController) {
+                const float L = laserLen;
+                float exr = laserOx + laserDx*L, eyr = laserOy + laserDy*L, ezr = laserOz + laserDz*L;
                 // Solid red beam, full length (no fade).
-                float lv[12] = { eqLaserOx,eqLaserOy,eqLaserOz, 1.0f,0.25f,0.25f,
+                float lv[12] = { laserOx,laserOy,laserOz, 1.0f,0.25f,0.25f,
                                  exr,eyr,ezr,                   1.0f,0.25f,0.25f };
                 glBindBuffer(GL_ARRAY_BUFFER, gLaserVbo);
                 glBufferData(GL_ARRAY_BUFFER, sizeof(lv), lv, GL_DYNAMIC_DRAW);
@@ -3229,7 +3302,7 @@ void *renderThread(void *) {
             // head rotation/translation) so it marks where the gaze ray points.
             // Drawn last, on top. Shown (in gaze mode) when the gaze is over an
             // interactable lobby control.
-            if (gReticleVertCount > 0 && eqShowReticle) {
+            if (gReticleVertCount > 0 && showReticle) {
                 const float kReticleDist = 1.5f;
                 Mat4 rMvp = mat4Mul(sproj, mat4Mul(sEyeShift, mat4Translate(0, 0, -kReticleDist)));
                 glUseProgram(gProg);

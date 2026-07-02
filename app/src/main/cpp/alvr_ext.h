@@ -21,6 +21,12 @@ extern "C" bool alvr_get_frame_timeout(uint64_t *out_timestamp_ns,
                                        void **out_buffer_ptr,
                                        uint64_t timeout_ns);
 
+// Manual-lobby power save: when paused, decoded NALs are discarded before the
+// MediaCodec so the HW decoder idles (server keeps sending; only client decode
+// stops). Resuming (paused=false) requests a fresh IDR so playback restarts from a
+// clean keyframe. The decoder object stays alive across the toggle (no teardown).
+extern "C" void alvr_set_decoder_paused(bool paused);
+
 // BOUNDED variants of the stock buffer-filling getters. The upstream
 // alvr_hud_message / alvr_get_settings_json / alvr_get_decoder_config copy the
 // full internal (server-controlled) length into the caller buffer with no size

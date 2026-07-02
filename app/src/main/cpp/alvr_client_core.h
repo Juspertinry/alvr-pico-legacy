@@ -292,7 +292,11 @@ uint64_t alvr_get_settings_json(char *out_buffer);
 // Will be updated after receiving StreamingStarted event
 uint64_t alvr_get_server_version(char *out_buffer);
 
-// Returns the number of bytes of the decoder_buffer
+// Returns the number of bytes of the decoder_buffer.
+// DEPRECATED in this fork: copies the full internal length with no cap, so an
+// oversized (server-controlled) config overflows the caller's buffer. Do not call;
+// use alvr_get_decoder_config_bounded (alvr_ext.h). Export kept only because other
+// projects still link the stock symbol from the shared .so.
 uint64_t alvr_get_decoder_config(char *out_buffer);
 
 void alvr_send_battery(uint64_t device_id, float gauge_value, bool is_plugged);

@@ -137,7 +137,7 @@ static void buildCoreModel(MenuModel &m) {
         eye.onChange = []{ saveEyeDebug(); gEyeTrackReapply.store(true); };
         dbg.items.push_back(eye);
 
-        MenuItem diag; diag.kind = MK_DROPDOWN; diag.label = "DIAG HUD";
+        MenuItem diag; diag.kind = MK_DROPDOWN; diag.label = "DIAGNOSTICS HUD";
         diag.options = { "OFF", "PIPELINE", "SYSTEM" };
         diag.get = []{ return (float)gDiagHudMode.load(); };
         diag.set = [](float v){ gDiagHudMode.store((int)(v+0.5f)); };
