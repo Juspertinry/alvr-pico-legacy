@@ -72,7 +72,7 @@ static std::atomic<bool> gTrackRunning{false};   // tracking-thread lifetime
 // ALVR path ids -- file scope so BOTH the render thread (button-id log) and the
 // tracking thread (uplink) can see them. Populated once in renderThread after
 // alvr_initialize(), before the tracking thread is started.
-struct BtnIds { uint64_t trigVal, gripVal, thumbX, thumbY, thumbClick, menu, face1, face2; };
+struct BtnIds { uint64_t trigVal, gripVal, thumbX, thumbY, thumbClick, thumbTouch, menu, face1, face2; };
 static uint64_t alvrHeadId = 0;
 static uint64_t alvrHandId[2] = { 0, 0 };
 static BtnIds   alvrBtn[2] = {};
@@ -1026,7 +1026,7 @@ static void *trackingThread(void *) {
     float    ctrlOrigin[3] = { 0.0f, 1.6f, 0.0f };
     bool     ctrlOriginSet = false;
     // controller button edge-detect state (only emit deltas; see render loop note)
-    bool  lastBin[2][4]  = {};
+    bool  lastBin[2][5]  = {};
     bool  binInit[2]     = { false, false };
     float lastScal[2][4] = {};
     bool  scalInit[2]    = { false, false };
@@ -1338,6 +1338,10 @@ static void *trackingThread(void *) {
         static const float kStickExpo  = 0.6f;
         static const float kStickDead  = 0.06f;
         static const float kStickOuter = 0.20f;
+        // Inferred-touch threshold: no capacitive pad on these sticks, so treat any
+        // deflection past this radius as "finger on the stick". Kept just under
+        // kStickDead so touch always latches before locomotion starts moving.
+        static const float kStickTouch = 0.05f;
         auto stickCurve = [](float x) -> float {
             float s = (x < 0.0f) ? -1.0f : 1.0f;
             float a = fabsf(x); if (a > 1.0f) a = 1.0f;
@@ -1372,6 +1376,12 @@ static void *trackingThread(void *) {
             if (grip == 0.0f && k[3]) grip = 1.0f;
             sendScalEdge(h, 3, alvrBtn[h].gripVal, grip);
             sendBinEdge(h, 0, alvrBtn[h].thumbClick, k[4] != 0);
+            // Inferred stick touch: deflection past kStickTouch, or a click (which is
+            // physically a press, so the finger is certainly on it). Uses the RAW
+            // radius, not the post-curve stx/sty, so the deadzone doesn't hide it.
+            float rx = (k[0] - 128) / 128.0f, ry = (k[1] - 128) / 128.0f;
+            bool  stickTouched = (rx*rx + ry*ry) > (kStickTouch * kStickTouch) || k[4] != 0;
+            sendBinEdge(h, 4, alvrBtn[h].thumbTouch, stickTouched);
             sendBinEdge(h, 1, alvrBtn[h].menu,       k[5] != 0);
             sendBinEdge(h, 2, alvrBtn[h].face1,      k[6] != 0);
             sendBinEdge(h, 3, alvrBtn[h].face2,      k[7] != 0);
@@ -1606,6 +1616,10 @@ void *renderThread(void *) {
         PID(thumbX,     "/input/thumbstick/x");
         PID(thumbY,     "/input/thumbstick/y");
         PID(thumbClick, "/input/thumbstick/click");
+        // These wands have no capacitive stick, so the runtime never gets a touch
+        // event -- games that gate locomotion/turn on thumbstick/touch then ignore
+        // the stick entirely. Infer touch from deflection (see the send below).
+        PID(thumbTouch, "/input/thumbstick/touch");
         PID(menu,       "/input/menu/click");
         // Face buttons: right = a/b, left = x/y (the server registers both sets on the
         // left hand but only a/b on the right, so pick per hand).
