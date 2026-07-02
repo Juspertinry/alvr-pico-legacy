@@ -3,6 +3,7 @@
 A fork of the ALVR client with support for the Pico Neo 2 and Neo 2 Eye.
 Works with [ALVR server 20.14.1](https://github.com/alvr-org/ALVR/releases/tag/v20.14.1).
 
+
 ## Features
 
 - Lobby accessible from anywhere with a double-press of the right app button
@@ -10,6 +11,18 @@ Works with [ALVR server 20.14.1](https://github.com/alvr-org/ALVR/releases/tag/v
 - Software IPD adjustment
 - Eye tracking (Neo 2 Eye)
 - Diagnostic HUD (latency and system stats)
+
+
+## Recommended server settings
+
+| Setting | Value |
+| --- | --- |
+| Codec | HEVC |
+| Resolution | Medium |
+| Foveation preset | High |
+| Preferred framerate | 72 Hz |
+| Bitrate | Constant, 50–100 Mbps |
+
 
 
 ## Third-party binaries
