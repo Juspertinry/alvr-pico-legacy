@@ -1,6 +1,16 @@
-# alvr-pico-legacy
+# ALVR for Pico Neo 2
 
-ALVR client fork for devices running the legacy SDK prior to OpenXR support.
+A fork of the ALVR client with support for the Pico Neo 2 and Neo 2 Eye.
+Works with [ALVR server 20.14.1](https://github.com/alvr-org/ALVR/releases/tag/v20.14.1).
+
+## Features
+
+- Lobby accessible from anywhere with a double-press of the right app button
+- In-app 16-band audio equalizer
+- Software IPD adjustment
+- Eye tracking (Neo 2 Eye)
+- Diagnostic HUD (latency and system stats)
+
 
 ## Third-party binaries
 
