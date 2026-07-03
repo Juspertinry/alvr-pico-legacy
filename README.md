@@ -33,6 +33,6 @@ that are not covered by the MIT license:
 - `libPvr_UnitySDK.so` (PICO / Pico Interactive SDK)
 - `libtracking_module.so` (PICO / Pico Interactive SDK)
 
-These are property of Pico Interactive / PICO and are subject to PICO's own SDK
+These are property of Pico Interactive / PICO / ByteDance and are subject to PICO's own SDK
 license terms. If you are the rights holder and object to their inclusion, open
 an issue and they will be removed.
