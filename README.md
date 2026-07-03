@@ -19,7 +19,7 @@ Works with [ALVR server 20.14.1](https://github.com/alvr-org/ALVR/releases/tag/v
 | --- | --- |
 | Codec | HEVC |
 | Resolution | Medium |
-| Foveation preset | High |
+| Foveation preset | Medium |
 | Preferred framerate | 72 Hz |
 | Bitrate | Constant, 50–100 Mbps |
 
