@@ -173,6 +173,18 @@ Java_com_alvr_pico2_MainActivity_nativeSetSleep(JNIEnv *env, jobject thiz, jbool
     LOGI("nativeSetSleep(%d)", (int)(sleep == JNI_TRUE));
 }
 
+// Test hook (fired from adb via a broadcast, see MainActivity): arm the low-battery
+// popup at `pct` without waiting for a real battery crossing. Sets exactly the state
+// pollBatteryWarn() would, so the render loop's drawBatteryWarn picks it up.
+extern "C" JNIEXPORT void JNICALL
+Java_com_alvr_pico2_MainActivity_nativeTestBatteryWarn(JNIEnv *env, jobject thiz, jint pct) {
+    (void) env; (void) thiz;
+    int p = (int) pct; if (p < 0) p = 0; if (p > 100) p = 100;
+    gBattWarnPct.store(p);
+    gBattWarnStartNs.store(nowNs());
+    LOGI("nativeTestBatteryWarn(%d) -> low-battery popup armed (adb test hook)", p);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_alvr_pico2_MainActivity_nativeStop(JNIEnv *env, jobject thiz) {
     (void) thiz;

@@ -113,9 +113,24 @@ static void buildCoreModel(MenuModel &m) {
         br.vmin = 0.0f; br.vmax = 1.0f;
         br.get = []{ return gBrightnessFrac.load(); };
         br.set = [](float f){ gBrightnessFrac.store(f); gBrightnessSaved.store(true); gBrightnessApply.store(true); };
-        br.valueText = [](char *b,int n){ snprintf(b,n,"%d%%",(int)(gBrightnessFrac.load()*100.0f+0.5f)); };
+        br.valueText = [](char *b,int n){ snprintf(b,n,"%d PERCENT",(int)(gBrightnessFrac.load()*100.0f+0.5f)); };   // no '%' glyph in the font
         br.onCommit = []{ saveBrightness(); };
         video.items.push_back(br);
+
+        // FIELD OF VIEW (higher-DPI lever): lower the per-eye FOV so the fixed server
+        // buffer packs more pixels into the visible lens cone. A release-commit slider:
+        // set() only updates the displayed value live during the drag (the "NN DEG"
+        // readout above the bar follows the knob); the expensive apply -- warp mesh
+        // rebuild (Pvr_SetProjectionFov + fEyeTextureFov globals) + resend view_params
+        // -- fires ONCE on release via onCommit -> gFovDirty, so dragging doesn't churn
+        // a warp re-point every frame. Range 50 deg .. headset native (kFovMax).
+        MenuItem fov; fov.kind = MK_FADER; fov.label = "FIELD OF VIEW";
+        fov.vmin = kFovMin; fov.vmax = kFovMax;
+        fov.get = []{ return gStreamFovDeg.load(); };
+        fov.set = [](float v){ gStreamFovDeg.store(roundf(v)); };   // live readout only (integer deg); no apply
+        fov.valueText = [](char *b,int n){ snprintf(b,n,"%.0f DEG", gStreamFovDeg.load()); };
+        fov.onCommit = []{ gFovDirty.store(true); };                // apply + save on release
+        video.items.push_back(fov);
     }
     m.push_back(video);
 

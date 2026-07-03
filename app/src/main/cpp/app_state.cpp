@@ -20,6 +20,9 @@ std::atomic<bool>  gThemeAmber{false};
 std::atomic<float> gBrightnessFrac{1.0f};
 std::atomic<bool>  gBrightnessSaved{false};
 
+std::atomic<float> gStreamFovDeg{101.0f};   // full per-eye FOV; 101 = SDK native (no change)
+std::atomic<bool>  gFovDirty{false};
+
 std::atomic<bool> gGridThemeDirty{false};
 std::atomic<bool> gEyeTrackReapply{false};
 std::atomic<bool> gBrightnessApply{false};
@@ -27,6 +30,9 @@ std::atomic<bool> gBrightnessApply{false};
 std::atomic<int> gVidDecoded{0}, gVidSubmit{0}, gVidDropped{0};
 std::atomic<int> gGapMsX10{0}, gRenderMsX10{0}, gEncMsX10{0}, gEnqMsX10{0};
 std::atomic<int> gFenceTimeouts{0};   // warp-submit fence-wait timeouts/sec
+
+std::atomic<uint64_t> gBattWarnStartNs{0};
+std::atomic<int>      gBattWarnPct{0};
 
 // ---------------------------------------------------------------------------
 // Unified persistence: one $HOME/config.txt, each setting on its own line as
@@ -60,6 +66,9 @@ void saveAllConfig() {
     fprintf(f, "%d\n",   gEqPresetIdx);
     for (int i = 0; i < kEqBands; i++) fprintf(f, "%.2f%c", gEqCustoms[0][i], i == kEqBands - 1 ? '\n' : ' ');
     for (int i = 0; i < kEqBands; i++) fprintf(f, "%.2f%c", gEqCustoms[1][i], i == kEqBands - 1 ? '\n' : ' ');
+    // Stream FOV: appended LAST so an older config.txt without it just leaves the
+    // default on load (backward compatible, no positional migration).
+    fprintf(f, "%.2f\n", gStreamFovDeg.load());
     fclose(f);
 }
 
@@ -134,6 +143,9 @@ void loadAllConfig() {
             p += adv;
         }
     }
+    // Stream FOV (final line). Missing on an old file -> keep the default.
+    if (fgets(ln, sizeof(ln), f) && sscanf(ln, "%f", &fv) == 1)
+        gStreamFovDeg.store(clampf(fv, kFovMin, kFovMax));
     fclose(f);
     LOGI("config: loaded %s", path);
     }
@@ -146,5 +158,6 @@ void loadAllConfig() {
 void saveSoftIpd()    { saveAllConfig(); }
 void saveEyeDebug()   { saveAllConfig(); }
 void saveDiagHud()    { saveAllConfig(); }
+void saveStreamFov()  { saveAllConfig(); }
 void saveTheme()      { saveAllConfig(); }
 void saveBrightness() { gBrightnessSaved.store(true); saveAllConfig(); }

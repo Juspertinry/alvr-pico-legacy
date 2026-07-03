@@ -32,6 +32,22 @@ extern std::atomic<bool>  gThemeAmber;   // lobby UI theme: false=cold blue, tru
 extern std::atomic<float> gBrightnessFrac; // HMD panel brightness 0..1 (VIDEO tab slider)
 extern std::atomic<bool>  gBrightnessSaved; // a brightness value was persisted (vs. panel default)
 
+// ---- Stream FOV (higher-DPI lever) -----------------------------------------
+// The server renders into a FIXED per-eye buffer (1664^2) at whatever FOV the
+// CLIENT commands via alvr view_params. The Neo 2 lens tube masks off the outer
+// ring, so any FOV rendered beyond the visible cone is wasted encode/decode/
+// thermal budget. Shrinking the commanded FOV packs the same pixels into fewer
+// degrees = higher pixels-per-degree (sharper) at IDENTICAL decoder/thermal cost.
+// To avoid magnification/"squish" the warp's texture FOV must shrink in lockstep
+// (Pvr_SetProjectionFov + the SDK fEyeTextureFov0/1 globals) so the narrower eye
+// texture still maps onto the correct lens angle. Full per-eye FOV in DEGREES.
+// 101 = the SDK's native per-eye texture FOV (the headset max) = no change; lower
+// it to trade edge FOV for pixel density. Adjusted via a release-commit slider.
+constexpr float kFovMin = 70.0f, kFovMax = 101.0f;   // full per-eye FOV range, degrees
+extern std::atomic<float> gStreamFovDeg;   // full per-eye FOV, degrees (persisted)
+extern std::atomic<bool>  gFovDirty;       // changed -> re-apply (server view_params + warp mesh)
+void saveStreamFov();
+
 // ---- render-thread side-effect requests ------------------------------------
 // The data-driven menu (menu_model) runs without access to the render thread's GL
 // context, JNIEnv, or locomotion locals, so menu callbacks just raise these flags;
@@ -56,6 +72,15 @@ extern std::atomic<int> gGapMsX10, gRenderMsX10, gEncMsX10, gEnqMsX10;
 // GPU-complete within budget -> the warp may sample a partially-written texture =
 // tear). 0 in healthy streaming; >0 flags a render overrun (e.g. thermal stall).
 extern std::atomic<int> gFenceTimeouts;
+
+// ---- low-battery warning ---------------------------------------------------
+// Headset battery %, polled ~1Hz from sysfs by the render loop. On a downward
+// crossing of 15% / 5% the loop stamps gBattWarnStartNs + the crossed percentage;
+// the draw path then shows a 5-second head-locked pop-up (slides up, holds, slides
+// back down) in both the stream and lobby paths, regardless of the diagnostics HUD.
+extern std::atomic<uint64_t> gBattWarnStartNs;   // 0 = inactive; else popup start (CLOCK_MONOTONIC ns)
+extern std::atomic<int>      gBattWarnPct;        // percentage to display in the popup
+constexpr uint64_t kBattWarnDurNs = 5000000000ULL;  // popup lifetime (5 s)
 
 // ---- persistence (single $HOME/config.txt) ---------------------------------
 // loadAllConfig() restores every setting at boot; saveAllConfig() rewrites the

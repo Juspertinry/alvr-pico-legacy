@@ -151,7 +151,7 @@ static void buildSysOverlay(std::vector<float> &v) {
         uiTextL(v, b, colL[c], yTop-(r+1)*dy, px, col[0], col[1], col[2]);
     };
     auto pctStr = [](char *b, size_t n, const char *lbl, float p){
-        if (p < 0) snprintf(b, n, "%s --", lbl); else snprintf(b, n, "%s %.0f%%", lbl, p);
+        if (p < 0) snprintf(b, n, "%s --", lbl); else snprintf(b, n, "%s %.0f", lbl, p);   // no '%' glyph; bare number in the dense grid
     };
 
     // --- Column 0: CPU ---
@@ -181,7 +181,7 @@ static void buildSysOverlay(std::vector<float> &v) {
     auto batCell = [&](int c, const char *lbl, float p){
         char b[96];
         if (p < 0) snprintf(b, sizeof(b), "%s --", lbl);
-        else       snprintf(b, sizeof(b), "%s %.0f%%", lbl, p);
+        else       snprintf(b, sizeof(b), "%s %.0f", lbl, p);   // no '%' glyph; bare number in the dense grid
         const float *col = (p >= 0.0f && p < 20.0f) ? hotCol : valCol;
         uiTextL(v, b, colL[c], yTop - 5.0f*dy, px, col[0], col[1], col[2]);
     };
@@ -189,6 +189,18 @@ static void buildSysOverlay(std::vector<float> &v) {
     batCell(1, "CTRL R", held[11]);
 
     uiTextC(v, "SYSTEM TELEMETRY", 0.0f, yTop - 6.0f*dy - 0.010f, px*0.9f, 0.55f, 0.65f, 0.78f);
+}
+
+void buildBatteryWarn(std::vector<float> &v, int pct) {
+    // Severity tint: <=5% critical red, otherwise the low-battery amber.
+    float bg[3], hd[3];
+    if (pct <= 5) { bg[0]=0.26f; bg[1]=0.02f; bg[2]=0.02f; hd[0]=1.00f; hd[1]=0.32f; hd[2]=0.28f; }
+    else          { bg[0]=0.20f; bg[1]=0.14f; bg[2]=0.01f; hd[0]=1.00f; hd[1]=0.82f; hd[2]=0.32f; }
+    const float px = 0.0024f;
+    appendQuad(v, -0.21f, 0.066f, 0.21f, -0.066f, bg[0], bg[1], bg[2]);   // card (drawn first)
+    uiTextC(v, "LOW BATTERY", 0.0f, 0.030f, px, hd[0], hd[1], hd[2]);
+    char line[32]; snprintf(line, sizeof(line), "%d PERCENT REMAINING", pct);   // no '%' glyph in the font
+    uiTextC(v, line, 0.0f, -0.022f, px*0.78f, 0.95f, 0.96f, 1.00f);
 }
 
 void buildDiagOverlay(std::vector<float> &v, int page) {

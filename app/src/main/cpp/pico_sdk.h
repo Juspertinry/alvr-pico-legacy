@@ -65,6 +65,17 @@ extern "C" {
     void *GetRenderEventFunc();
     bool  Pvr_SetSinglePassDepthBufferWidthHeight(int width, int height);
     void  Pvr_GetFOV(float *outA, float *outB);
+    // Set the per-eye projection FOV in DEGREES (X,Y). RE'd from libPvr_UnitySDK:
+    // Pvr_SetProjectionFov_ -> PVR::GlobalConfig::SetFovDegrees(float,float), which
+    // just stores the two args into the GlobalConfig instance (offsets +20/+24).
+    // Under the armeabi-v7a softfp ABI the two floats arrive in r0/r1, matching the
+    // impl. GetFovDegrees reads them back (falling back to psmvr_GetFloatConfig 11/12
+    // when zero). The warp's distortion/projection is built from this at mesh-build
+    // time (EV_InitRenderThread), so a live change needs the warp re-pointed. This is
+    // the "higher DPI" lever: shrink the FOV so the fixed eye buffer packs more pixels
+    // into the visible lens cone. Pair with fEyeTextureFov0/1 (the mesh's texture FOV)
+    // and the client's alvr view_params so server render + warp map agree (no squish).
+    void  Pvr_SetProjectionFov(float fovXDeg, float fovYDeg);
     float Pvr_GetIPD();   // device IPD in METERS (Neo 2: fixed ~0.065)
     // --- HW compositor (DIATW) eye-buffer submit path ----------------------
     // Feed our rendered eye textures to the SDK warp thread, which does HW lens

@@ -444,6 +444,7 @@ static int    gReticleVertCount = 0;
 static GLuint gEqVao = 0, gEqVbo = 0;           // lobby 16-band audio EQ panel (dynamic)
 static GLuint gLaserVao = 0, gLaserVbo = 0;     // controller laser beam (dynamic, world-space)
 static GLuint gDiagVao = 0, gDiagVbo = 0;       // streaming diagnostics overlay (dynamic, NDC)
+static GLuint gWarnVao = 0, gWarnVbo = 0;       // low-battery warning pop-up (dynamic)
 static void buildTextBuffers() {
     glGenVertexArrays(1, &gTextVao);
     glBindVertexArray(gTextVao);
@@ -489,6 +490,15 @@ static void buildTextBuffers() {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
+    // low-battery warning pop-up (same pos.xyz+rgb layout)
+    glGenVertexArrays(1, &gWarnVao);
+    glBindVertexArray(gWarnVao);
+    glGenBuffers(1, &gWarnVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, gWarnVbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
     glBindVertexArray(0);
 }
 
@@ -513,7 +523,12 @@ static int      gVideoRecvPinTries = 0;
 // the server. Called at STREAMING_STARTED and again whenever the IPD changes mid
 // -stream so the server's render tracks the lobby setting without a reconnect.
 static void sendViewParams() {
-    const float hh = 50.5f * (float) M_PI / 180.0f;   // per-eye half-FOV (~101deg total)
+    // Per-eye HALF-FOV in radians = half the client-commanded full FOV. The stock
+    // server renders the fixed eye buffer to exactly this (Hmd::SetViewsConfig ->
+    // GetProjectionRaw), so lowering gStreamFovDeg packs more pixels/degree for free.
+    // This MUST match what writeSdkFov() hands the warp, or the server's image is
+    // stretched across the warp's map -- the apply block keeps them in lockstep.
+    const float hh = gStreamFovDeg.load() * 0.5f * (float) M_PI / 180.0f;
     AlvrViewParams vp[2];
     for (int e = 0; e < 2; e++) {
         vp[e].pose.orientation = { 0, 0, 0, 1 };
@@ -614,6 +629,98 @@ static void buildReticle() {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
+    glBindVertexArray(0);
+}
+
+// Push a per-eye FULL FOV (degrees) into the SDK warp's texture/projection mapping:
+// the distortion-mesh texture FOV globals (fEyeTextureFov0/1, which our lobby proj
+// also reads) AND GlobalConfig via Pvr_SetProjectionFov. Does NOT rebuild the warp
+// mesh -- the caller re-points the warp (EV_InitRenderThread) when a live change must
+// take effect. At startup this runs before the warp inits, so the baked default is
+// correct with no re-point.
+static void writeSdkFov(float fullDeg) {
+    fEyeTextureFov0 = fullDeg;
+    fEyeTextureFov1 = fullDeg;
+    Pvr_SetProjectionFov(fullDeg, fullDeg);
+    LOGI("writeSdkFov(%.2f): fEyeTextureFov0/1 + GlobalConfig FovDegrees set", fullDeg);
+}
+
+// Poll headset battery (~1Hz, self-throttled) and arm the low-battery popup on a
+// downward crossing of 15% / 5%. Safe to call every frame from any render path;
+// only the first call each second actually reads sysfs.
+static void pollBatteryWarn() {
+    static uint64_t sNext = 0;
+    static int sLastBatt = -1;
+    uint64_t now = nowNs();
+    if (now < sNext) return;
+    sNext = now + 1000000000ULL;
+    long cap = -1;
+    FILE *bf = fopen("/sys/class/power_supply/battery/capacity", "r");
+    if (bf) { if (fscanf(bf, "%ld", &cap) != 1) cap = -1; fclose(bf); }
+    if (cap < 0 || cap > 100) return;
+    if (sLastBatt >= 0) {
+        const int th[2] = { 15, 5 };
+        for (int i = 0; i < 2; i++)
+            if (sLastBatt > th[i] && cap <= th[i]) {
+                gBattWarnPct.store((int) cap);
+                gBattWarnStartNs.store(nowNs());
+                LOGI("BATTERY: %ld%% -- low-battery warning (crossed %d%%)", cap, th[i]);
+            }
+    }
+    sLastBatt = (int) cap;
+}
+
+// Draw ONE eye of the low-battery popup into the currently-bound eye target. It's a
+// head-locked card that slides up from below into its resting position, holds, then
+// slides back down across the 5s window. No-op when the popup is inactive. Every
+// render path calls this LAST so the popup layers OVER the diagnostics HUD. Caller
+// owns the FBO/attachment + viewport; we touch only program/VAO/uniform + the GL
+// enable state we need. Projected at the warp's current texture FOV (fEyeTextureFov0)
+// so its on-lens position is INDEPENDENT of the FIELD OF VIEW setting (same fix as
+// the diag HUD -- a fixed 90deg here would shift/scale it when the FOV changes).
+static void drawBatteryWarn(int eye) {
+    uint64_t bwStart = gBattWarnStartNs.load();
+    if (bwStart == 0) return;
+    uint64_t bwNow = nowNs();
+    if (bwNow - bwStart >= kBattWarnDurNs) return;
+
+    static std::vector<float> sWarnV;
+    static int sWarnCount = 0;
+    static uint64_t sWarnKey = 0;
+    if (sWarnKey != bwStart) {   // rebuild geometry once per activation
+        sWarnV.clear();
+        buildBatteryWarn(sWarnV, gBattWarnPct.load());
+        sWarnCount = (int)(sWarnV.size()/6);
+        glBindBuffer(GL_ARRAY_BUFFER, gWarnVbo);
+        glBufferData(GL_ARRAY_BUFFER, sWarnV.size()*sizeof(float), sWarnV.data(), GL_DYNAMIC_DRAW);
+        sWarnKey = bwStart;
+    }
+    if (sWarnCount <= 0) return;
+
+    // Vertical slide: smoothstep up over the first slideDur, hold, smoothstep down.
+    float phase = (float)(bwNow - bwStart) / 1e9f;
+    const float slideDur = 0.45f, yTravel = 0.55f;
+    const float dur = (float)kBattWarnDurNs / 1e9f;
+    float off;
+    if (phase < slideDur)            { float f=phase/slideDur;        float e=f*f*(3.0f-2.0f*f); off=-(1.0f-e)*yTravel; }
+    else if (phase > dur - slideDur) { float f=(dur-phase)/slideDur; if(f<0)f=0; float e=f*f*(3.0f-2.0f*f); off=-(1.0f-e)*yTravel; }
+    else                              off=0.0f;
+
+    float hudFovRad = (fEyeTextureFov0 > 1.0f ? fEyeTextureFov0 : 101.0f) * 0.01745329f;
+    Mat4 proj = mat4Perspective(hudFovRad, 1.0f, 0.05f, 50.0f);
+    const float a = -30.0f * 0.01745329f;
+    float ca = cosf(a), sa = sinf(a);
+    Mat4 rx = mat4Identity(); rx.m[5]=ca; rx.m[6]=sa; rx.m[9]=-sa; rx.m[10]=ca;
+    Mat4 sc = mat4Identity(); sc.m[0]=1.125f; sc.m[5]=1.125f; sc.m[10]=1.125f;
+    Mat4 model = mat4Mul(mat4Mul(mat4Translate(0.0f, -0.22f + off, -1.0f), rx), sc);
+    float exh = (eye == 0 ? -softIpdM()*0.5f : softIpdM()*0.5f);
+    Mat4 mvp = mat4Mul(proj, mat4Mul(mat4Translate(-exh,0,0), model));
+
+    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+    glUseProgram(gProg);
+    glBindVertexArray(gWarnVao);
+    glUniformMatrix4fv(gMvpLoc, 1, GL_FALSE, mvp.m);
+    glDrawArrays(GL_TRIANGLES, 0, sWarnCount);
     glBindVertexArray(0);
 }
 
@@ -922,12 +1029,17 @@ static bool pinVideoRecvThreadForLowLatency(int reservedCpu) {
 // Level range is 0..5 (0..5 accepted, >=6 rejected; 5 = max, 0 = the system default
 // baseline). SetCpuLevel/SetGpuLevel(5,true) takes effect on this device.
 static const int kPerfLevelMax = 5;   // max valid perf level (hardware ceiling)
-// Level we actually PIN CPU+GPU to. The top level (5 -> GPU 710MHz) heats the SD845
-// fast, then the thermal driver clamps hard -> a boost/throttle sawtooth. Pinning one
-// level lower (4) targets a steadier clock (~675MHz GPU) on both CPU and GPU. Root-
-// free + universal (Pico perf service, not sysfs). Thermal step-down still applies
-// (kPerfLevelPin-1 when hot). Set == kPerfLevelMax to restore the old top pin.
-static const int kPerfLevelPin = 4;
+// Levels we PIN GPU and CPU to. These are set independently: a perf-level sweep under a
+// live 72Hz stream showed the pipeline is GPU-bound, not CPU-bound. GPU clock decides
+// whether we hold 72Hz (it collapses below ~596MHz); the top level (5 -> 710MHz) heats
+// the SD845 fast into a boost/throttle sawtooth, so we pin one below (4 -> ~675MHz) for
+// a steady clock with headroom. The big-cluster CPU clock, by contrast, barely moves
+// FPS or latency -- even the lowest gold clock held full rate -- so we pin CPU lower
+// (3 -> ~2092MHz) to shed gold-cluster heat, which frees shared SoC thermal budget for
+// the GPU that actually needs it. Root-free + universal (Pico perf service, not sysfs).
+// Thermal step-down still applies (pin-1 when hot).
+static const int kGpuPerfPin = 4;
+static const int kCpuPerfPin = 3;
 // Baseline perf levels captured BEFORE we ever change them (the system default we
 // restore to when releasing the floor).
 static bool gPerfBaseCaptured = false;
@@ -974,7 +1086,7 @@ static float gpuZoneTempC() {
     return best < 0 ? -1.0f : (float)best / 1000.0f;
 }
 
-// THERMAL-ADAPTIVE perf level. We normally hard-pin CPU/GPU to kPerfLevelPin (removes
+// THERMAL-ADAPTIVE perf level. We normally hard-pin CPU/GPU to their base pins (removes
 // the governor's ramp-up latency when cool -- tighter frame timing). But on this
 // thermally limited SD845, sustained heavy worlds drive the GPU into the high 80s/90s
 // where the governor HARD-clamps the clock anyway.
@@ -985,7 +1097,9 @@ static float gpuZoneTempC() {
 // eases the SoC before the governor's harder clamp -> smoother throttle, not a cliff.
 static const float kHotC  = 88.0f;   // step down above this GPU temp
 static const float kCoolC = 82.0f;   // restore to the pin below this (hysteresis)
-static int desiredPerfLevel() {
+// Thermal backoff state, shared by both domains: true once the GPU crosses kHotC, until
+// it falls back below kCoolC. Sampled at ~1Hz off the render loop.
+static bool perfBackedOff() {
     static bool   sBackedOff = false;
     static uint64_t sLastSample = 0;
     uint64_t now = nowNs();
@@ -1002,30 +1116,71 @@ static int desiredPerfLevel() {
             }
         }
     }
-    return sBackedOff ? (kPerfLevelPin - 1) : kPerfLevelPin;
+    return sBackedOff;
 }
+// Desired level for a domain given its base pin, applying the shared thermal step-down.
+static int desiredPerfLevel(int basePin) { return perfBackedOff() ? (basePin - 1) : basePin; }
 
 // Apply a perf level (>=0 pins CPU+GPU to it; -1 releases to the captured
 // baseline). Returns true once the perf service accepted it; SetCpuLevel returns
 // -1 until the QVR service client is bound, so the caller retries.
-static bool applyPerfLevels(int level) {
+static bool applyCpuLevel(int level) {
     capturePerfBaseline();
     bool on = (level >= 0);
     if (level > kPerfLevelMax) level = kPerfLevelMax;     // defensive clamp to valid range
-    int wantCpu = on ? level : gPerfBaseCpu;
-    int wantGpu = on ? level : gPerfBaseGpu;
-    int rc = SetCpuLevel(wantCpu, on);   // 2nd arg = sustained/static floor while pinned
-    int rg = SetGpuLevel(wantGpu, on);
-    if (rc < 0 || rg < 0) {              // perf service client not bound yet -> retry
+    int want = on ? level : gPerfBaseCpu;
+    int rc = SetCpuLevel(want, on);      // 2nd arg = sustained/static floor while pinned
+    if (rc < 0) {                        // perf service client not bound yet -> retry
         static bool warned = false;
-        if (!warned) { warned = true; LOGI("perf: Set Cpu/Gpu Level not applied yet (rc=%d rg=%d) -- service client null; retrying", rc, rg); }
+        if (!warned) { warned = true; LOGI("perf: SetCpuLevel not applied yet (rc=%d) -- service client null; retrying", rc); }
         return false;
     }
-    int cl = -1, gl = -1; bool cs = false, gs = false;
-    GetCpuLevel(cl, cs); GetGpuLevel(gl, gs);   // read back what actually took
-    LOGI("perf: target=%d (%s) -> CPU=%d GPU=%d (rc=%d rg=%d; readback cpu=%d gpu=%d)",
-         level, on ? "pin" : "release", wantCpu, wantGpu, rc, rg, cl, gl);
+    int cl = -1; bool cs = false; GetCpuLevel(cl, cs);   // read back what actually took
+    LOGI("perf: CPU target=%d (%s) -> want=%d (rc=%d; readback cpu=%d)", level, on ? "pin" : "release", want, rc, cl);
     return true;
+}
+static bool applyGpuLevel(int level) {
+    capturePerfBaseline();
+    bool on = (level >= 0);
+    if (level > kPerfLevelMax) level = kPerfLevelMax;
+    int want = on ? level : gPerfBaseGpu;
+    int rg = SetGpuLevel(want, on);
+    if (rg < 0) {
+        static bool warned = false;
+        if (!warned) { warned = true; LOGI("perf: SetGpuLevel not applied yet (rg=%d) -- service client null; retrying", rg); }
+        return false;
+    }
+    int gl = -1; bool gs = false; GetGpuLevel(gl, gs);
+    LOGI("perf: GPU target=%d (%s) -> want=%d (rg=%d; readback gpu=%d)", level, on ? "pin" : "release", want, rg, gl);
+    return true;
+}
+
+// Read a single integer from a sysfs node (-1 on failure).
+static long readSysfsLong(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long v = -1; if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+// Log the real GPU + per-cluster CPU clocks the SoC settled at, so the adb-driven perf
+// sweep is self-documenting in logcat. GPU cur/min/max come from kgsl devfreq (Hz);
+// CPU cur/min from cpufreq (kHz). cur reflects instantaneous clock (GPU idles down with
+// no load), min reflects the floor the perf service actually raised.
+static void logActualClocks(const char *ctx) {
+    long gcur = readSysfsLong("/sys/class/kgsl/kgsl-3d0/gpuclk");
+    long gmin = readSysfsLong("/sys/class/kgsl/kgsl-3d0/devfreq/min_freq");
+    long gmax = readSysfsLong("/sys/class/kgsl/kgsl-3d0/devfreq/max_freq");
+    long c0   = readSysfsLong("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq");
+    long c0m  = readSysfsLong("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq");
+    long c4   = readSysfsLong("/sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq");
+    long c4m  = readSysfsLong("/sys/devices/system/cpu/cpu4/cpufreq/scaling_min_freq");
+    LOGI("perf-sweep %s: GPU cur=%ld min=%ld max=%ld MHz | little cur=%ld min=%ld MHz | big cur=%ld min=%ld MHz",
+         ctx,
+         gcur > 0 ? gcur / 1000000 : -1, gmin > 0 ? gmin / 1000000 : -1, gmax > 0 ? gmax / 1000000 : -1,
+         c0 > 0 ? c0 / 1000 : -1, c0m > 0 ? c0m / 1000 : -1,
+         c4 > 0 ? c4 / 1000 : -1, c4m > 0 ? c4m / 1000 : -1);
 }
 
 // Fixed-rate tracking/uplink thread. Reads the head pose, derives filtered
@@ -1588,6 +1743,11 @@ void *renderThread(void *) {
     // client searches for an ALVR PC server on the LAN (mDNS) and connects.
     setHomeFromFilesDir(env, gActivity);   // before any ALVR storage access
     loadAllConfig();                        // restore ALL persisted settings (single $HOME/config.txt)
+    // Apply the persisted STREAM FOV to the SDK NOW -- before the warp thread is
+    // created (that happens at the first surface's EV_InitRenderThread), so the warp
+    // builds its distortion mesh with the right texture FOV and no live re-point is
+    // needed for the baked/persisted default. Runs after Pvr_Init so it isn't clobbered.
+    writeSdkFov(gStreamFovDeg.load());
     applyUiTheme(gThemeAmber.load());        // apply the restored lobby UI theme
     if (gBrightnessSaved.load()) {
         applyHmdBrightness(gBrightnessFrac.load(), env);   // re-apply the saved level
@@ -1944,19 +2104,26 @@ void *renderThread(void *) {
             }
         }
 
-        // MAX PERFORMANCE (always on): hold the CPU/GPU pinned at the level
-        // desiredPerfLevel() returns (kPerfLevelMax). The binder call only fires once
-        // the target is reached; applyPerfLevels returns false until the QVR perf
-        // service client binds, so the first apply retries each frame until it takes.
+        // Hold GPU and CPU pinned at their base pins (GPU 4, CPU 3) while streaming.
+        // applyGpuLevel/applyCpuLevel return false until the QVR perf service client
+        // binds, so the first apply retries each frame until it takes.
         if (rtInited) {
-            static int perfApplied = -2;  // sentinel: != any real level (0..5) or -1 release
+            static int cpuApplied = -2, gpuApplied = -2;  // sentinel: != any level (0..5) or -1
             // Only hold the CPU/GPU floor pinned while actively streaming. In the lobby
             // (!gStreaming) or when the headset is doffed/asleep (gSleepReq), RELEASE to
             // the captured baseline (-1) so the SoC can downclock -- no reason to burn
             // watts + self-heat pinned at max when there's no video to keep at 72Hz.
-            int want = (!gStreaming || gSleepReq.load()) ? -1 : desiredPerfLevel();
-            if (want != perfApplied && applyPerfLevels(want))
-                perfApplied = want;
+            bool release = (!gStreaming || gSleepReq.load());
+            int wantGpu = release ? -1 : desiredPerfLevel(kGpuPerfPin);
+            int wantCpu = release ? -1 : desiredPerfLevel(kCpuPerfPin);
+            if (wantGpu != gpuApplied && applyGpuLevel(wantGpu)) {
+                gpuApplied = wantGpu;
+                logActualClocks("gpu");
+            }
+            if (wantCpu != cpuApplied && applyCpuLevel(wantCpu)) {
+                cpuApplied = wantCpu;
+                logActualClocks("cpu");
+            }
 
             // Report battery to the server (~1/sec) so the SteamVR dashboard is populated.
             if (gStreaming) {
@@ -2014,6 +2181,34 @@ void *renderThread(void *) {
             sendViewParams();
             LOGI("Software IPD changed mid-stream -> resent view_params (%.1f mm)", gSoftIpdMm.load());
         }
+
+        // ---- FIELD OF VIEW committed (slider released) ----------------------
+        // Apply the higher-DPI FOV lever. Writing the SDK globals + GlobalConfig alone
+        // doesn't rebuild the warp's already-built distortion mesh, so re-point the warp
+        // (same Pause/Init/Resume the resume path uses) to make the change take effect
+        // live; then resend view_params so the server renders the new cone at the SAME
+        // FOV the warp now maps (else the image stretches). Needs a live window surface
+        // + inited warp. Only fires on slider release (onCommit), not during the drag.
+        if (gFovDirty.exchange(false)) {
+            float eff = gStreamFovDeg.load();
+            writeSdkFov(eff);
+            if (rtInited && gWarpToWindow && re && warpCtx != EGL_NO_CONTEXT && sfc != EGL_NO_SURFACE) {
+                re(EV_Pause);
+                eglMakeCurrent(dpy, sfc, sfc, warpCtx);
+                re(EV_InitRenderThread);   // rebuild the warp mesh at the new FOV
+                re(EV_Resume);
+                eglMakeCurrent(dpy, pbuf, pbuf, ctx);
+                gAtwEnabled = false;       // re-enable ATW on the next submit
+                LOGI("FIELD OF VIEW: warp re-pointed at %.1f deg", eff);
+            }
+            if (gStreaming) sendViewParams();   // server renders the new cone
+            saveStreamFov();
+            LOGI("FIELD OF VIEW applied: %.1f deg", eff);
+        }
+
+        // Low-battery watch: self-throttled to ~1Hz, arms the popup on a 15%/5%
+        // crossing. Cheap to call every frame; covers both the stream + lobby paths.
+        pollBatteryWarn();
 
         // ---- ALVR: drain events --------------------------------------------
         AlvrEvent ev;
@@ -2594,7 +2789,12 @@ void *renderThread(void *) {
                     // we feed gSwap straight to the warp. The only thing left to draw
                     // here is the optional diag HUD, overlaid into the just-rendered slot.
                     int diagPage = gDiagHudMode.load();
-                    if (diagPage != 0) {
+                    // Low-battery popup active window (5s after a 15%/5% crossing). It
+                    // draws into gSwap on OUR ctx just like the HUD, so it shares the
+                    // FBO-bind / fence handling below even when the HUD is off.
+                    bool warnActive = gBattWarnStartNs.load() != 0 &&
+                                      (nowNs() - gBattWarnStartNs.load()) < kBattWarnDurNs;
+                    if (diagPage != 0 || warnActive) {
                         // The HUD draws into gSwap in OUR ctx, so it must be
                         // ordered after ALVR's de-foveation render -> make our queue
                         // wait on the ALVR fence (GPU-side, no CPU/warp stall), then a
@@ -2633,7 +2833,13 @@ void *renderThread(void *) {
                         if (dc > 0) {
                             // Flat panel floating below centre, ~1m away, tilted up ~30deg
                             // to face the eyes. Per-eye offset gives it real (close) depth.
-                            Mat4 proj = mat4Perspective(1.5708f, 1.0f, 0.05f, 50.0f);  // ~90deg
+                            // Project at the warp's CURRENT texture FOV (fEyeTextureFov0), not a
+                            // fixed 90deg: the warp maps this eye texture as spanning that FOV, so
+                            // authoring the panel in the same angular space makes its on-lens
+                            // position/size INDEPENDENT of the FIELD OF VIEW setting. (A fixed 90deg
+                            // here let the FOV change magnify/shift the panel along with the video.)
+                            float hudFovRad = (fEyeTextureFov0 > 1.0f ? fEyeTextureFov0 : 101.0f) * 0.01745329f;
+                            Mat4 proj = mat4Perspective(hudFovRad, 1.0f, 0.05f, 50.0f);
                             const float a = -30.0f * 0.01745329f;   // -ve = face tilts UP
                             float ca = cosf(a), sa = sinf(a);
                             Mat4 rx = mat4Identity();
@@ -2692,6 +2898,15 @@ void *renderThread(void *) {
                         }
                       } // end if (diagPage != 0)
 
+                      // Low-battery popup -- drawn LAST so it layers OVER the diag HUD.
+                      // Per-eye: bind that eye's slot, then the shared head-locked draw.
+                      if (warnActive) {
+                          for (int e = 0; e < 2; e++) {
+                              glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                     GL_TEXTURE_2D, gSwap[e][gSwapIdx], 0);
+                              drawBatteryWarn(e);
+                          }
+                      }
                       glBindFramebuffer(GL_FRAMEBUFFER, 0);
                     }
                     // PIPELINE: fence THIS slot and FLUSH so the GPU starts it, but DO
@@ -2700,9 +2915,9 @@ void *renderThread(void *) {
                     // is long-signalled -> no torn texture, no render stall.
                     uint64_t _tEncStart = diagTiming ? nowNs() : 0;
                     if (gSwapFence[gSwapIdx]) glDeleteSync(gSwapFence[gSwapIdx]);
-                    if (diagPage != 0) {
-                        // HUD path: render + HUD were issued in our ctx, ordered after
-                        // ALVR via glWaitSync; a fresh fence covers them both.
+                    if (diagPage != 0 || warnActive) {
+                        // HUD / battery-popup path: extra work was issued in our ctx,
+                        // ordered after ALVR via glWaitSync; a fresh fence covers it all.
                         gSwapFence[gSwapIdx] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
                         glFlush();
                     } else {
@@ -2904,7 +3119,9 @@ void *renderThread(void *) {
         if (!sHudHave || hudSig != sHudSig) {
             static std::vector<float> tverts; tverts.clear();   // reuse capacity
             appendTextLine(tverts, gModelText,  yTopM, pxM, kUiTitle[0], kUiTitle[1], kUiTitle[2]);  // model: themed title
-            appendTextLine(tverts, gIpText,     yTopI, pxI, 1.0f, 1.0f, 1.0f);  // IP: white
+            bool haveIp = (gIpText[0] >= '0' && gIpText[0] <= '9');
+            if (haveIp) appendTextLine(tverts, gIpText, yTopI, pxI, 1.0f, 1.0f, 1.0f);   // IP: white
+            else        appendTextLine(tverts, gIpText, yTopI, pxI, 1.0f, 0.09f, 0.07f);  // CHECK WI-FI: scarlet
             if (haveHost)
                 appendTextLine(tverts, gHostnameText, yTopH, pxH, 1.0f, 0.8f, 0.4f);  // hostname: amber
             appendTextLine(tverts, gStatusText, yTopS, pxS, sr, sg, sb);        // status: state colour
@@ -3348,6 +3565,7 @@ void *renderThread(void *) {
                         glClearColor(0, 0, 0, 1);
                         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                         drawLobbyScene(proj, view, eyeShift);
+                        drawBatteryWarn(eye);   // low-battery popup, layered over lobby content
                     }
                     glBindFramebuffer(GL_FRAMEBUFFER, 0);
                     // PIPELINE: fence THIS slot + glFlush so the GPU starts it, but

@@ -1,7 +1,10 @@
 package com.alvr.pico2;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -57,6 +60,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private native void nativeSurfaceDestroyed();
     private native void nativeStop();
     private native void nativeSetSleep(boolean sleep);
+    // Test hook: arm the low-battery popup at a given percentage (see mTestReceiver).
+    private native void nativeTestBatteryWarn(int pct);
     private native void nativeKeyEvent(int keyCode, boolean down);
     private native void nativeControllerState(int hand, int conn,
             float[] sensor, float[] angVel, int[] keys);
@@ -172,6 +177,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
     }
 
+    // ---- adb test hook: fire in-app popups without the real trigger condition ----
+    // Exported broadcast that arms the low-battery popup, for QA on device:
+    //   adb shell am broadcast -a com.alvr.pico2.TEST_BATTERY_WARN --ei pct 15 -p com.alvr.pico2
+    // Omit --ei pct to default to 15%; use --ei pct 5 for the critical (red) variant.
+    static final String ACTION_TEST_BATTERY_WARN = "com.alvr.pico2.TEST_BATTERY_WARN";
+    private final BroadcastReceiver mTestReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context ctx, Intent intent) {
+            if (intent == null) return;
+            if (ACTION_TEST_BATTERY_WARN.equals(intent.getAction())) {
+                int pct = intent.getIntExtra("pct", 15);
+                Log.i(TAG, "test intent -> low-battery popup at " + pct + "%");
+                try { nativeTestBatteryWarn(pct); } catch (Throwable t) { Log.e(TAG, "nativeTestBatteryWarn failed", t); }
+            }
+        }
+    };
+    private void registerTestReceiver() {
+        IntentFilter f = new IntentFilter(ACTION_TEST_BATTERY_WARN);
+        try {
+            // API 33+ requires the export flag; pre-33 dynamic receivers are exported
+            // by default, which is what lets `adb shell am broadcast` (shell uid) reach it.
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(mTestReceiver, f, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(mTestReceiver, f);
+            }
+            Log.i(TAG, "test-intent receiver registered (" + ACTION_TEST_BATTERY_WARN + ")");
+        } catch (Throwable t) { Log.e(TAG, "registerTestReceiver failed", t); }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -189,6 +223,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         setupControllers();
         setupProximitySleep();
+        registerTestReceiver();
     }
 
     @Override
@@ -516,6 +551,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        try { unregisterReceiver(mTestReceiver); } catch (Throwable t) { /* not registered */ }
         mMainHandler.removeCallbacks(mSleepRunnable);
         if (mSensorManager != null) {
             try { mSensorManager.unregisterListener(mProximityListener); } catch (Throwable t) { /* ignore */ }
